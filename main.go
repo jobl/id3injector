@@ -95,7 +95,7 @@ func calculateCRC(data []byte) uint32 {
 	return crc
 }
 
-// Apple HLS timed metadata descriptors.
+// HLS timed metadata descriptors (stream type 0x15, ID3v2.4 in PES).
 var (
 	// Program-level metadata_pointer_descriptor.
 	appleMetaDescriptor = []byte{
@@ -580,7 +580,7 @@ func generateMetaFrame(metaTag []byte, metaPID int, rawPTS [5]byte, cc int) []by
 	return frame
 }
 
-// modifyPMT adds an Apple-compatible metadata stream entry to a PMT packet.
+// modifyPMT adds a timed metadata stream entry to a PMT packet.
 // Returns the modified frame and the metadata stream PID.
 func modifyPMT(original []byte, metaPID int) ([]byte, int) {
 	mod := bytes.Repeat([]byte{0xFF}, packetSize)
@@ -607,7 +607,7 @@ func modifyPMT(original []byte, metaPID int) ([]byte, int) {
 		ptr = streamBase + oldProgInfoLen
 	}
 
-	// Append Apple metadata descriptor
+	// Append program-level metadata descriptor
 	extra := copy(mod[ptr:], appleMetaDescriptor)
 	ptr += extra
 	mod[piOfs+1] = byte(oldProgInfoLen + extra)
@@ -1175,7 +1175,7 @@ func run() error {
 	listenAddr := flag.String("listen", "", "HTTP listen address (e.g. :8080 or 127.0.0.1:8080)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "id3injector %s – ID3 metadata injector for MPEG TS (HLS)\n\n", version)
+		fmt.Fprintf(os.Stderr, "id3injector %s – ID3v2.4 timed metadata injector for MPEG TS\n\n", version)
 		fmt.Fprintf(os.Stderr, "Usage: %s [-i file] [-o file] [-e file] [-d]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Input and output are auto-inferred from pipes when omitted.\n\n")
 		flag.PrintDefaults()

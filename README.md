@@ -6,7 +6,8 @@
 [![Go](https://img.shields.io/badge/go-1.24+-00ADD8?logo=go)](https://go.dev/)
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](UNLICENSE)
 
-ID3 timed metadata injector for MPEG Transport Streams (HLS).
+ID3v2.4 timed metadata injector for MPEG Transport Streams. Works with any TS stream and follows the HLS timed metadata convention (stream type 0x15) supported by Apple, ExoPlayer, hls.js, Shaka Player, and most broadcast toolchains. Supports static metadata files, live injection via FIFO or HTTP, and real-time piped streams.
+
 Single static binary, zero runtime dependencies.
 
 **Tested on:**
@@ -40,7 +41,7 @@ GOOS=darwin GOARCH=arm64 make build
 ## Usage
 
 ```
-id3injector – ID3 metadata injector for MPEG TS (HLS)
+id3injector – ID3v2.4 timed metadata injector for MPEG TS
 
 Usage: id3injector [-i file] [-o file] [-e file] [-d]
 
@@ -98,7 +99,7 @@ When piping, `-i` and `-o` are optional. Stdin and stdout are detected automatic
 curl -s https://example.com/stream.ts | id3injector -v
 ```
 
-When injecting, id3injector modifies the PMT to add Apple-compatible metadata descriptors and a new elementary stream PID, auto-assigned as highest existing PID + 1.
+When injecting, id3injector modifies the PMT to add a metadata elementary stream (stream type 0x15, ID3v2.4 in PES) with metadata_pointer_descriptor and metadata_descriptor. The metadata PID is auto-assigned as the highest existing PID + 1.
 
 ## Metadata format
 
