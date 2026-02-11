@@ -14,6 +14,7 @@ Single static binary, zero runtime dependencies.
 - Ubuntu 22.04.5 LTS (amd64)
 - Ubuntu 24.04.3 LTS (amd64)
 - macOS 15.5 (arm64)
+- Windows 11 (amd64)
 
 ## Installation
 
