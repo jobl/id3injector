@@ -2,12 +2,16 @@
 
 [![Test](https://github.com/jobl/id3injector/actions/workflows/test.yml/badge.svg)](https://github.com/jobl/id3injector/actions/workflows/test.yml)
 [![Lint](https://github.com/jobl/id3injector/actions/workflows/lint.yml/badge.svg)](https://github.com/jobl/id3injector/actions/workflows/lint.yml)
+[![Release](https://img.shields.io/github/v/release/jobl/id3injector)](https://github.com/jobl/id3injector/releases/latest)
 [![Go](https://img.shields.io/badge/go-1.24+-00ADD8?logo=go)](https://go.dev/)
 [![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](UNLICENSE)
 
 ID3 timed metadata injector for MPEG Transport Streams (HLS).
+Single static binary, zero runtime dependencies.
 
-Single static binary, zero runtime dependencies. Tested on Ubuntu 22.04 and macOS 15.5.
+**Tested on:**
+- Ubuntu 22.04
+- macOS 15.5
 
 ## Installation
 
