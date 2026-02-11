@@ -335,6 +335,12 @@ ffmpeg -re -f lavfi -i testsrc=duration=10:size=320x240:rate=30 \
   | ffplay pipe:0
 ```
 
+## Acknowledgments
+
+Inspired by [dusterio/hlsinjector](https://github.com/dusterio/hlsinjector) by Denis Mysenko.
+
+Windows testing by [Thomas Jammet](https://github.com/thomasjammet).
+
 ## License
 
 This is free and unencumbered software released into the public domain. See [UNLICENSE](UNLICENSE).
