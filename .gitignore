@@ -1,0 +1,22 @@
+# Binary
+id3injector
+id3injector.exe
+
+# Test artifacts
+*.ts
+
+# GoReleaser output
+dist/
+
+# macOS
+.DS_Store
+._*
+
+# Linux
+*~
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
