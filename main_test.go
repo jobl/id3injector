@@ -153,7 +153,8 @@ func TestGenerateID3Frame_Valid(t *testing.T) {
 }
 
 func TestGenerateID3Frame_TooLong(t *testing.T) {
-	long := make([]byte, maxID3FrameLen+1)
+	// Content that would produce an ID3 tag exceeding maxID3TagSize
+	long := make([]byte, maxID3TagSize)
 	for i := range long {
 		long[i] = 'A'
 	}
@@ -177,14 +178,18 @@ func TestGenerateID3Frame_Empty(t *testing.T) {
 // Meta frame (TS packet) generation
 // --------------------------------------------------------------------
 
-func TestGenerateMetaFrame_Structure(t *testing.T) {
+func TestGenerateMetaFrames_SinglePacket(t *testing.T) {
 	id3, _ := generateID3Frame("Test")
 	rawPTS := [5]byte{0x21, 0x00, 0x07, 0xE1, 0x01}
-	frame := generateMetaFrame(id3, 0x102, rawPTS, 5)
+	data, numPkts := generateMetaFrames(id3, 0x102, rawPTS, 5)
 
-	if len(frame) != packetSize {
-		t.Fatalf("frame length = %d, want %d", len(frame), packetSize)
+	if numPkts != 1 {
+		t.Fatalf("numPackets = %d, want 1", numPkts)
 	}
+	if len(data) != packetSize {
+		t.Fatalf("data length = %d, want %d", len(data), packetSize)
+	}
+	frame := data[:packetSize]
 	if frame[0] != syncByte {
 		t.Errorf("sync byte = 0x%02X, want 0x%02X", frame[0], syncByte)
 	}
@@ -201,30 +206,138 @@ func TestGenerateMetaFrame_Structure(t *testing.T) {
 	if frame[3]&0x0F != 5 {
 		t.Errorf("CC = %d, want 5", frame[3]&0x0F)
 	}
-	// PES start code
-	if frame[4] != 0 || frame[5] != 0 || frame[6] != 1 {
-		t.Errorf("PES start code = %v, want [0 0 1]", frame[4:7])
+	// PES start code (after adaptation field)
+	pesStart := 4
+	if frame[3]&0x20 != 0 {
+		pesStart = 4 + 1 + int(frame[4])
+	}
+	if frame[pesStart] != 0 || frame[pesStart+1] != 0 || frame[pesStart+2] != 1 {
+		t.Errorf("PES start code not found at offset %d", pesStart)
 	}
 	// stream_id = private_stream_1
-	if frame[7] != 0xBD {
-		t.Errorf("stream_id = 0x%02X, want 0xBD", frame[7])
-	}
-	// PTS bytes preserved
-	if frame[13] != rawPTS[0] || frame[14] != rawPTS[1] {
-		t.Error("raw PTS not correctly placed")
-	}
-	// ID3 tag at end
-	if string(frame[packetSize-len(id3):packetSize-len(id3)+3]) != "ID3" {
-		t.Error("ID3 tag not found at end of packet")
+	if frame[pesStart+3] != 0xBD {
+		t.Errorf("stream_id = 0x%02X, want 0xBD", frame[pesStart+3])
 	}
 }
 
-func TestGenerateMetaFrame_CCWrap(t *testing.T) {
+func TestGenerateMetaFrames_CCWrap(t *testing.T) {
 	id3, _ := generateID3Frame("X")
-	frame := generateMetaFrame(id3, 0x100, [5]byte{}, 16)
+	data, _ := generateMetaFrames(id3, 0x100, [5]byte{}, 16)
+	frame := data[:packetSize]
 	// CC > 15 should wrap to 0
 	if cc := frame[3] & 0x0F; cc != 0 {
 		t.Errorf("CC = %d, want 0 (wrapped from 16)", cc)
+	}
+}
+
+func TestGenerateMetaFrames_MultiPacket(t *testing.T) {
+	// Create a tag larger than what fits in a single packet (~170 bytes)
+	bigContent := make([]byte, 500)
+	for i := range bigContent {
+		bigContent[i] = byte('A' + i%26)
+	}
+	// Build a raw ID3 tag manually
+	tag := append([]byte("ID3\x04\x00\x00\x00\x00\x03\x76"), bigContent...) // ~510 bytes
+
+	rawPTS := [5]byte{0x21, 0x00, 0x07, 0xE1, 0x01}
+	data, numPkts := generateMetaFrames(tag, 0x103, rawPTS, 0)
+
+	if numPkts < 2 {
+		t.Fatalf("expected multiple packets, got %d", numPkts)
+	}
+	if len(data) != numPkts*packetSize {
+		t.Fatalf("data length = %d, want %d", len(data), numPkts*packetSize)
+	}
+
+	// Verify all packets have correct sync byte and PID
+	for p := 0; p < numPkts; p++ {
+		pkt := data[p*packetSize : (p+1)*packetSize]
+		if pkt[0] != syncByte {
+			t.Errorf("packet %d: sync byte = 0x%02X, want 0x%02X", p, pkt[0], syncByte)
+		}
+		pid := int(binary.BigEndian.Uint16(pkt[1:3]) & pidMask)
+		if pid != 0x103 {
+			t.Errorf("packet %d: PID = 0x%X, want 0x103", p, pid)
+		}
+	}
+
+	// First packet must have PUSI set
+	if data[1]&0x40 == 0 {
+		t.Error("first packet: PUSI not set")
+	}
+	// Continuation packets must have PUSI clear
+	for p := 1; p < numPkts; p++ {
+		if data[p*packetSize+1]&0x40 != 0 {
+			t.Errorf("packet %d: PUSI should not be set", p)
+		}
+	}
+
+	// Verify continuity counters increment
+	for p := 0; p < numPkts; p++ {
+		expectedCC := p & 0x0F
+		actualCC := int(data[p*packetSize+3] & 0x0F)
+		if actualCC != expectedCC {
+			t.Errorf("packet %d: CC = %d, want %d", p, actualCC, expectedCC)
+		}
+	}
+
+	// Extract the ID3 tag back from the packets and verify it matches
+	var extracted []byte
+	for p := 0; p < numPkts; p++ {
+		pkt := data[p*packetSize : (p+1)*packetSize]
+		payloadStart := 4
+		if pkt[3]&0x20 != 0 { // adaptation field present
+			payloadStart = 4 + 1 + int(pkt[4])
+		}
+		if p == 0 {
+			// Skip PES header (14 bytes)
+			payloadStart += pesHeaderSize
+		}
+		extracted = append(extracted, pkt[payloadStart:packetSize]...)
+	}
+
+	// The extracted data should start with our ID3 tag
+	if len(extracted) < len(tag) {
+		t.Fatalf("extracted %d bytes, need at least %d", len(extracted), len(tag))
+	}
+	if string(extracted[:3]) != "ID3" {
+		t.Error("extracted data does not start with ID3 header")
+	}
+	if !bytes.Equal(extracted[:len(tag)], tag) {
+		t.Error("extracted ID3 tag does not match original")
+	}
+}
+
+func TestGenerateMetaFrames_BoundaryExact(t *testing.T) {
+	// Create a tag that exactly fills the first packet (no stuffing needed)
+	exactSize := firstPacketPayload - pesHeaderSize // 170 bytes
+	tag := make([]byte, exactSize)
+	copy(tag, "ID3\x04\x00\x00")
+	for i := 6; i < len(tag); i++ {
+		tag[i] = byte(i)
+	}
+
+	data, numPkts := generateMetaFrames(tag, 0x100, [5]byte{}, 0)
+	if numPkts != 1 {
+		t.Fatalf("expected 1 packet for exact fit, got %d", numPkts)
+	}
+	if len(data) != packetSize {
+		t.Fatalf("data length = %d, want %d", len(data), packetSize)
+	}
+}
+
+func TestGenerateMetaFrames_BoundaryPlusOne(t *testing.T) {
+	// One byte over single-packet capacity forces a second packet
+	overSize := firstPacketPayload - pesHeaderSize + 1
+	tag := make([]byte, overSize)
+	copy(tag, "ID3\x04\x00\x00")
+
+	data, numPkts := generateMetaFrames(tag, 0x100, [5]byte{}, 0)
+	if numPkts != 2 {
+		t.Fatalf("expected 2 packets, got %d", numPkts)
+	}
+	if len(data) != 2*packetSize {
+		t.Fatalf("data length = %d, want %d", len(data), 2*packetSize)
 	}
 }
 
@@ -235,7 +348,8 @@ func TestGenerateMetaFrame_CCWrap(t *testing.T) {
 func TestParseFrame_RoundTrip(t *testing.T) {
 	id3, _ := generateID3Frame("RoundTrip")
 	rawPTS := [5]byte{0x21, 0x00, 0x07, 0xE1, 0x01}
-	frame := generateMetaFrame(id3, 0x102, rawPTS, 3)
+	data, _ := generateMetaFrames(id3, 0x102, rawPTS, 3)
+	frame := data[:packetSize]
 
 	var parsed parsedFrame
 	parseFrame(frame, &parsed)
@@ -507,13 +621,11 @@ func TestParseMetadataFile_MalformedLine(t *testing.T) {
 	}
 }
 
-func TestParseMetadataFile_OversizedTag(t *testing.T) {
+func TestParseMetadataFile_LargeTag(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "big.txt")
-	// maxPlaintextLen is 128, anything under that generates a valid ID3 tag;
-	// but maxID3TagSize is 170, so a 128-char plaintext should produce a tag
-	// that exceeds 170 bytes.
-	big := make([]byte, maxPlaintextLen)
+	// 500-char plaintext: large but within limits (multi-packet capable now)
+	big := make([]byte, 500)
 	for i := range big {
 		big[i] = 'A'
 	}
@@ -521,11 +633,15 @@ func TestParseMetadataFile_OversizedTag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := parseMetadataFile(f)
-	if err == nil {
-		// Depending on exact sizes, this may or may not trigger the error.
-		// If the generated tag fits, that's also fine — just ensure no panic.
-		t.Log("tag fit within limits (no error)")
+	entries, err := parseMetadataFile(f)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if len(entries[0].Tag) < 500 {
+		t.Errorf("tag too small: %d bytes", len(entries[0].Tag))
 	}
 }
 
@@ -616,7 +732,8 @@ func TestInjector_LiveChannel(t *testing.T) {
 	ch <- id3
 
 	// Create a PES frame with a valid timestamp so handleFrame triggers the drain
-	frame := generateMetaFrame(id3, 0x100, rawPTS, 0)
+	data, _ := generateMetaFrames(id3, 0x100, rawPTS, 0)
+	frame := data[:packetSize]
 
 	var parsed parsedFrame
 	parseFrame(frame, &parsed)
@@ -657,7 +774,8 @@ func TestInjector_LiveChannel_Empty(t *testing.T) {
 		metaPID: 0x102,
 	}
 
-	frame := generateMetaFrame(id3, 0x100, rawPTS, 0)
+	data, _ := generateMetaFrames(id3, 0x100, rawPTS, 0)
+	frame := data[:packetSize]
 	var parsed parsedFrame
 	parseFrame(frame, &parsed)
 
@@ -1237,6 +1355,187 @@ func TestEndToEnd_InjectAndVerify(t *testing.T) {
 	}
 	if id3Count != 2 {
 		t.Errorf("found %d ID3 tags in output, want 2", id3Count)
+	}
+}
+
+func TestEndToEnd_MultiPacketInject(t *testing.T) {
+	// Build a stream with PAT + PMT + 3 video PES packets (0s, 1s, 2s)
+	input := buildMinimalTSStream(3)
+
+	// Create a large ID3 tag (~500 bytes) that requires multiple TS packets
+	payload := make([]byte, 480)
+	for i := range payload {
+		payload[i] = byte('A' + i%26)
+	}
+	framePayload := 1 + len(payload) + 1 // encoding + text + null
+	tagBody := 10 + framePayload
+	tag := make([]byte, 0, 10+tagBody)
+	// ID3v2.4 header
+	tag = append(tag, 'I', 'D', '3', 4, 0, 0)
+	ss := encodeSyncsafe(tagBody)
+	tag = append(tag, ss[0], ss[1], ss[2], ss[3])
+	// TPE1 frame header
+	tag = append(tag, 'T', 'P', 'E', '1')
+	fs := encodeSyncsafe(framePayload)
+	tag = append(tag, fs[0], fs[1], fs[2], fs[3])
+	tag = append(tag, 0, 0) // frame flags
+	tag = append(tag, 3)    // UTF-8
+	tag = append(tag, payload...)
+	tag = append(tag, 0) // null terminator
+
+	// Verify the tag is larger than single-packet capacity
+	if len(tag) <= firstPacketPayload-pesHeaderSize {
+		t.Fatalf("test tag (%d bytes) should exceed single packet capacity (%d)",
+			len(tag), firstPacketPayload-pesHeaderSize)
+	}
+
+	// Prepare a metadata entry at t=0
+	meta := []metaEntry{{Moment: 0, Tag: tag}}
+
+	// Run the injector
+	var outBuf bytes.Buffer
+	inj := &injector{
+		writer:   bufio.NewWriterSize(&outBuf, 64*1024),
+		metaData: meta,
+		metaCC:   0,
+	}
+
+	reader := bufio.NewReader(bytes.NewReader(input))
+	pmtPIDs := map[int]bool{}
+	buf := make([]byte, packetSize)
+	var parsed parsedFrame
+	frames := 0
+	for {
+		_, err := io.ReadFull(reader, buf)
+		if err != nil {
+			break
+		}
+		parseFrame(buf, &parsed)
+		if parsed.Type == framePAT {
+			for _, p := range parsed.Programs {
+				if p.ID != 0 {
+					pmtPIDs[p.PMTPID] = true
+				}
+			}
+		}
+		if pmtPIDs[parsed.PID] && parsed.Type != framePAT {
+			parsed.Type = framePMT
+		}
+		if err := inj.handleFrame(buf, &parsed, frames); err != nil {
+			t.Fatalf("handleFrame error at frame %d: %v", frames, err)
+		}
+		frames++
+	}
+	inj.writer.Flush()
+
+	if inj.injected != 1 {
+		t.Fatalf("injected = %d, want 1", inj.injected)
+	}
+
+	// Verify output is valid TS
+	output := outBuf.Bytes()
+	if len(output)%packetSize != 0 {
+		t.Fatalf("output size %d not a multiple of %d", len(output), packetSize)
+	}
+
+	// Calculate expected packets for the multi-packet ID3
+	_, expectedPkts := generateMetaFrames(tag, 0x101, [5]byte{}, 0)
+	if expectedPkts < 2 {
+		t.Fatalf("expected multi-packet injection, got %d packets", expectedPkts)
+	}
+
+	expectedFrames := frames + expectedPkts
+	outputFrames := len(output) / packetSize
+	if outputFrames != expectedFrames {
+		t.Errorf("output frames = %d, want %d (original %d + %d injected)",
+			outputFrames, expectedFrames, frames, expectedPkts)
+	}
+
+	// Find the metadata PID from the modified PMT
+	var metaPID int
+	outPMTpids := map[int]bool{}
+	var outParsed parsedFrame
+	for off := 0; off < len(output); off += packetSize {
+		pkt := output[off : off+packetSize]
+		parseFrame(pkt, &outParsed)
+		if outParsed.Type == framePAT {
+			for _, p := range outParsed.Programs {
+				if p.ID != 0 {
+					outPMTpids[p.PMTPID] = true
+				}
+			}
+		}
+		if outPMTpids[outParsed.PID] && outParsed.Type != framePAT {
+			outParsed.Type = framePMT
+			parseFrame(pkt, &outParsed)
+		}
+		if outParsed.Type == framePMT {
+			for _, s := range outParsed.Streams {
+				if s.Type == 21 {
+					metaPID = s.PID
+				}
+			}
+		}
+	}
+
+	if metaPID == 0 {
+		t.Fatal("metadata PID not found in modified PMT")
+	}
+
+	// Reassemble the multi-packet PES payload from all metadata PID packets
+	var pesPayload []byte
+	for off := 0; off < len(output); off += packetSize {
+		pkt := output[off : off+packetSize]
+		if pkt[0] != syncByte {
+			continue
+		}
+		pid := int(binary.BigEndian.Uint16(pkt[1:3]) & pidMask)
+		if pid != metaPID {
+			continue
+		}
+		payloadStart := 4
+		if pkt[3]&0x20 != 0 { // adaptation field
+			payloadStart = 4 + 1 + int(pkt[4])
+		}
+		if pkt[3]&0x10 != 0 { // has payload
+			pesPayload = append(pesPayload, pkt[payloadStart:]...)
+		}
+	}
+
+	// Parse the reassembled PES to extract the ID3 tag
+	if len(pesPayload) < pesHeaderSize {
+		t.Fatalf("PES payload too short: %d bytes", len(pesPayload))
+	}
+	// Verify PES start code
+	if pesPayload[0] != 0 || pesPayload[1] != 0 || pesPayload[2] != 1 || pesPayload[3] != 0xBD {
+		t.Fatalf("bad PES start code: %x", pesPayload[:4])
+	}
+	// Skip PES header to get ID3 data
+	pesHdrDataLen := int(pesPayload[8])
+	id3Start := 9 + pesHdrDataLen
+	if id3Start >= len(pesPayload) {
+		t.Fatalf("PES header extends beyond payload")
+	}
+	extractedID3 := pesPayload[id3Start:]
+
+	// Verify the extracted ID3 tag matches the original
+	if len(extractedID3) < len(tag) {
+		t.Fatalf("extracted ID3 too short: %d bytes, want at least %d", len(extractedID3), len(tag))
+	}
+	if !bytes.Equal(extractedID3[:len(tag)], tag) {
+		t.Error("extracted ID3 tag does not match original")
+		// Show first mismatch for debugging
+		for i := 0; i < len(tag); i++ {
+			if extractedID3[i] != tag[i] {
+				t.Errorf("first mismatch at byte %d: got 0x%02X, want 0x%02X", i, extractedID3[i], tag[i])
+				break
+			}
+		}
+	}
+
+	// Verify the payload text is intact
+	if !bytes.Contains(extractedID3, payload) {
+		t.Error("original payload text not found in extracted ID3 tag")
 	}
 }
 

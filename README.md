@@ -169,7 +169,7 @@ curl -X POST localhost:8080/inject -d "{\"id3_base64\":\"$TAG\"}"
 | PRIV | Vendor-specific binary (tracking, DRM) | Via `id3`/`id3_base64` |
 | GEOB | Arbitrary binary + MIME type | Via `id3`/`id3_base64` |
 
-> **Note:** All ID3 tags must fit in a single TS packet (max ~170 bytes). This is sufficient for text metadata but not for large binary payloads like album art.
+> **Note:** Small tags fit in a single TS packet (~170 bytes). Larger tags are automatically split across multiple packets, up to ~64 KB. This covers text metadata, structured key-value pairs, and moderately sized binary payloads.
 
 ## Live injection
 

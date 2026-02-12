@@ -31,12 +31,15 @@ const (
 	sectionLenMask = 0x03FF
 	maxCCValue     = 15
 
-	maxID3TagSize   = 170
-	maxPlaintextLen = 128
-	maxID3FrameLen  = 127
+	// Hard limit: PES packet length is a 16-bit field (65535),
+	// minus 8 bytes PES header overhead = 65527 bytes of ID3 data.
+	// Tags larger than 170 bytes are automatically split across multiple packets.
+	maxID3TagSize = 65527
 
-	// PES length for single-packet metadata.
-	pesMetaLength = 178
+	// TS payload sizes (packet minus headers).
+	firstPacketPayload       = 184 // 188 - 4 (TS header)
+	continuationPayload      = 184 // 188 - 4 (TS header)
+	pesHeaderSize            = 14  // PES header (9) + PTS (5)
 )
 
 // PMT section offsets (relative to section start, after pointer field).
@@ -524,13 +527,13 @@ func encodeSyncsafe(size int) [4]byte {
 
 // generateID3Frame creates a minimal ID3v2.4 frame with a TPE1 tag.
 func generateID3Frame(content string) ([]byte, error) {
-	if len(content) > maxID3FrameLen {
-		return nil, fmt.Errorf("content too long (%d > %d)", len(content), maxID3FrameLen)
-	}
-
 	framePayload := 1 + len(content) + 1 // encoding byte + text + null
 	tagBody := 10 + framePayload         // frame header + payload
 	totalSize := 10 + 10 + framePayload  // ID3 header + frame header + payload
+
+	if totalSize > maxID3TagSize {
+		return nil, fmt.Errorf("content too long: ID3 tag would be %d bytes (max %d)", totalSize, maxID3TagSize)
+	}
 
 	f := make([]byte, 0, totalSize)
 
@@ -552,32 +555,117 @@ func generateID3Frame(content string) ([]byte, error) {
 	return f, nil
 }
 
-// generateMetaFrame creates a 188-byte TS packet with PES-wrapped ID3 metadata.
-func generateMetaFrame(metaTag []byte, metaPID int, rawPTS [5]byte, cc int) []byte {
-	frame := bytes.Repeat([]byte{0xFF}, packetSize)
+// generateMetaFrames creates one or more 188-byte TS packets with PES-wrapped ID3 metadata.
+// Small tags (<=170 bytes) produce a single packet; larger tags are split across multiple.
+// Returns the concatenated packets and the number of packets (for CC tracking).
+func generateMetaFrames(metaTag []byte, metaPID int, rawPTS [5]byte, cc int) ([]byte, int) {
+	pesPayloadLen := pesHeaderSize + len(metaTag) // PES header + ID3 data
+	id3DataInFirst := firstPacketPayload - pesHeaderSize
+	if id3DataInFirst < 0 {
+		id3DataInFirst = 0
+	}
 
-	// Place metadata at end of packet
-	copy(frame[packetSize-len(metaTag):], metaTag)
+	numPackets := 1
+	if len(metaTag) > id3DataInFirst {
+		remaining := len(metaTag) - id3DataInFirst
+		numPackets += (remaining + continuationPayload - 1) / continuationPayload
+	}
 
-	// TS header
-	frame[0] = syncByte
-	be.PutUint16(frame[1:3], 0x4000|uint16(metaPID&pidMask))
-	frame[3] = byte(0x10 | (cc & 0x0F))
+	out := make([]byte, numPackets*packetSize)
 
-	// PES header
-	frame[4] = 0x00
-	frame[5] = 0x00
-	frame[6] = 0x01
-	frame[7] = 0xBD                // private_stream_1
-	be.PutUint16(frame[8:10], pesMetaLength) // PES length
-	frame[10] = 0x84                       // PES header flags
-	frame[11] = 0x80                       // PTS flag set
-	frame[12] = byte(packetSize - len(metaTag) - 13) // PES header data length (padding)
+	// Fill with 0xFF (adaptation field stuffing)
+	for i := range out {
+		out[i] = 0xFF
+	}
+
+	// --- First packet: TS header + PES header + PTS + start of ID3 ---
+	f := out[0:packetSize]
+
+	// TS header with PUSI=1
+	f[0] = syncByte
+	be.PutUint16(f[1:3], 0x4000|uint16(metaPID&pidMask))
+
+	if numPackets == 1 {
+		// Single packet: use adaptation field for stuffing
+		stuffLen := firstPacketPayload - pesPayloadLen
+		if stuffLen > 0 {
+			f[3] = byte(0x30 | (cc & 0x0F)) // adaptation + payload
+			f[4] = byte(stuffLen - 1)        // adaptation_field_length
+			if stuffLen > 1 {
+				f[5] = 0x00 // adaptation flags (no PCR, etc.)
+				// remaining stuffing bytes already 0xFF
+			}
+			pesStart := 4 + stuffLen
+			writePESHeader(f[pesStart:], rawPTS, len(metaTag))
+			copy(f[pesStart+pesHeaderSize:], metaTag)
+		} else {
+			f[3] = byte(0x10 | (cc & 0x0F)) // payload only
+			writePESHeader(f[4:], rawPTS, len(metaTag))
+			copy(f[4+pesHeaderSize:], metaTag)
+		}
+		return out, 1
+	}
+
+	// Multi-packet: first packet is fully filled (no stuffing)
+	f[3] = byte(0x10 | (cc & 0x0F)) // payload only
+	writePESHeader(f[4:], rawPTS, len(metaTag))
+	tagOffset := copy(f[4+pesHeaderSize:], metaTag[:id3DataInFirst])
+	tagOffset = id3DataInFirst
+
+	// --- Continuation packets ---
+	for p := 1; p < numPackets; p++ {
+		cc = (cc + 1) & 0x0F
+		pkt := out[p*packetSize : (p+1)*packetSize]
+
+		pkt[0] = syncByte
+		be.PutUint16(pkt[1:3], uint16(metaPID&pidMask)) // PUSI=0
+
+		remaining := len(metaTag) - tagOffset
+		chunkSize := continuationPayload
+		if remaining < chunkSize {
+			chunkSize = remaining
+		}
+
+		if chunkSize < continuationPayload {
+			// Last packet: use adaptation field for stuffing
+			stuffLen := continuationPayload - chunkSize
+			pkt[3] = byte(0x30 | (cc & 0x0F)) // adaptation + payload
+			pkt[4] = byte(stuffLen - 1)
+			if stuffLen > 1 {
+				pkt[5] = 0x00
+			}
+			copy(pkt[4+stuffLen:], metaTag[tagOffset:tagOffset+chunkSize])
+		} else {
+			pkt[3] = byte(0x10 | (cc & 0x0F)) // payload only
+			copy(pkt[4:], metaTag[tagOffset:tagOffset+chunkSize])
+		}
+		tagOffset += chunkSize
+	}
+
+	return out, numPackets
+}
+
+// writePESHeader writes the 14-byte PES header (9 header + 5 PTS) at dst.
+func writePESHeader(dst []byte, rawPTS [5]byte, id3Len int) {
+	dst[0] = 0x00
+	dst[1] = 0x00
+	dst[2] = 0x01
+	dst[3] = 0xBD // private_stream_1
+
+	// PES packet length = 3 (header flags) + 5 (PTS) + id3Len
+	pesLen := 3 + 5 + id3Len
+	if pesLen > 65535 {
+		pesLen = 0 // unbounded (per MPEG-2 spec)
+	}
+	be.PutUint16(dst[4:6], uint16(pesLen))
+
+	dst[6] = 0x84 // PES header flags
+	dst[7] = 0x80 // PTS flag
+	dst[8] = 0x05 // PES header data length (5 bytes of PTS)
 
 	// PTS marker nibble = 0010 (PTS only)
-	frame[13] = (rawPTS[0] & 0x0F) | 0x20
-	copy(frame[14:18], rawPTS[1:])
-	return frame
+	dst[9] = (rawPTS[0] & 0x0F) | 0x20
+	copy(dst[10:14], rawPTS[1:])
 }
 
 // modifyPMT adds a timed metadata stream entry to a PMT packet.
@@ -680,13 +768,13 @@ type injector struct {
 }
 
 func (inj *injector) writeMetaFrame(tag []byte, rawPTS [5]byte, count int) error {
-	mf := generateMetaFrame(tag, inj.metaPID, rawPTS, inj.metaCC)
-	fmt.Fprintf(os.Stderr, "Inserting ID3 frame after frame %d (len=%d)\n", count, len(mf))
-	if _, err := inj.writer.Write(mf); err != nil {
+	data, numPackets := generateMetaFrames(tag, inj.metaPID, rawPTS, inj.metaCC)
+	fmt.Fprintf(os.Stderr, "Inserting ID3 frame after frame %d (tag=%d bytes, packets=%d)\n", count, len(tag), numPackets)
+	if _, err := inj.writer.Write(data); err != nil {
 		return fmt.Errorf("write error: %w", err)
 	}
 	inj.injected++
-	inj.metaCC = (inj.metaCC + 1) & 0x0F
+	inj.metaCC = (inj.metaCC + numPackets) & 0x0F
 	return nil
 }
 
@@ -760,15 +848,9 @@ func parseMetaLine(line string) (moment int64, tag []byte, err error) {
 	format, content := strings.ToLower(parts[1]), parts[2]
 	switch format {
 	case "plaintext":
-		if len(content) > maxPlaintextLen {
-			return 0, nil, fmt.Errorf("plaintext too long (%d > %d)", len(content), maxPlaintextLen)
-		}
 		tag, err := generateID3Frame(content)
 		if err != nil {
 			return 0, nil, err
-		}
-		if len(tag) > maxID3TagSize {
-			return 0, nil, fmt.Errorf("tag exceeds max size (%d > %d)", len(tag), maxID3TagSize)
 		}
 		return moment, tag, nil
 	case "id3":
@@ -777,7 +859,7 @@ func parseMetaLine(line string) (moment int64, tag []byte, err error) {
 			return 0, nil, fmt.Errorf("cannot read ID3 file: %w", err)
 		}
 		if len(data) > maxID3TagSize {
-			return 0, nil, fmt.Errorf("tag exceeds max size (%d > %d)", len(data), maxID3TagSize)
+			return 0, nil, fmt.Errorf("ID3 file too large (%d > %d bytes)", len(data), maxID3TagSize)
 		}
 		return moment, data, nil
 	default:
@@ -851,7 +933,7 @@ func newInjectHandler(ch chan<- []byte) http.Handler {
 			Text      string `json:"text"`
 			ID3Base64 string `json:"id3_base64"`
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, 1024)
+		r.Body = http.MaxBytesReader(w, r.Body, 128*1024) // 128 KB request limit
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
@@ -873,7 +955,7 @@ func newInjectHandler(ch chan<- []byte) http.Handler {
 				return
 			}
 			if len(data) > maxID3TagSize {
-				http.Error(w, "ID3 tag too large", http.StatusBadRequest)
+				http.Error(w, fmt.Sprintf("ID3 tag too large (%d > %d bytes)", len(data), maxID3TagSize), http.StatusBadRequest)
 				return
 			}
 			tag = data
