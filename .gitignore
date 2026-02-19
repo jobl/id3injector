@@ -5,6 +5,9 @@ id3injector.exe
 # Test artifacts
 *.ts
 
+# Proprietary test data and scripts (kept locally, not in git)
+testdata/
+
 # GoReleaser output
 dist/
 
